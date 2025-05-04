@@ -5,11 +5,10 @@ import torch
 from beir import util
 from beir.datasets.data_loader import GenericDataLoader
 from beir.retrieval.evaluation import EvaluateRetrieval
-from collections import defaultdict
 from transformers import AutoTokenizer
 from gliclass import GLiClassModel, ZeroShotClassificationPipeline
-from tqdm import tqdm
-from typing import Dict, List
+from typing import Dict
+from labels_truncation_pipeline import ZeroShotWithTruncationPipeline
 
 
 class GLiClassBEIREvaluator(EvaluateRetrieval):
@@ -34,23 +33,16 @@ class GLiClassBEIREvaluator(EvaluateRetrieval):
 
     @staticmethod
     def prepare_data(corpus: Dict, queries: Dict, qrels: Dict):
-        unique_doc_ids = set()
-        for rels in qrels.values():
-            unique_doc_ids.update(rels.keys())
+        unique_doc_ids = list(set(corpus.keys()))
         documents = [
             f"{corpus[doc_id].get('title', '')} {corpus[doc_id].get('text', '')}".strip()
             for doc_id in unique_doc_ids
             if doc_id in corpus
         ]
-        qrels_list = []
+        queries_list = []
         for query_id in qrels:
-            example_dict = {
-                'query': queries[query_id],
-                'documents': documents
-            }
-            qrels_list.append(example_dict)
-
-        return qrels_list
+            queries_list.append(queries[query_id])
+        return queries_list, documents
 
     @staticmethod
     def text_to_id(text_scores_dict: Dict, corpus, queries):
@@ -76,72 +68,16 @@ class GLiClassBEIREvaluator(EvaluateRetrieval):
                         result[query_id][matched_doc_id] = score
         return result
 
-    @staticmethod
-    def chunk(dataset, chunk_size=25):
-        processed_dataset = []
-        for example in tqdm(dataset):
-            query = example['query']
-            documents = example['documents']
-            for i in range(0, len(documents), chunk_size):
-                doc_chunk = documents[i:i + chunk_size]
-                processed_dataset.append({
-                    'query': query,
-                    'documents': doc_chunk
-                })
-
-        return processed_dataset
-
-    def seq_process(self, data):
-        max_len = 2048
-        processed_data = []
-        for example in tqdm(data):
-            query_tokens = self.tokenizer.encode(example['query'], add_special_tokens=False)
-            query_len = len(query_tokens)
-            doc_token_lists = [
-                self.tokenizer.encode(doc, add_special_tokens=False)
-                for doc in example['documents']
-            ]
-            doc_lengths = [len(tokens) for tokens in doc_token_lists]
-            total_doc_len = sum(doc_lengths)
-            available = max_len - query_len
-            if available <= 0:
-                continue
-            processed_docs = []
-            for tokens, length in zip(doc_token_lists, doc_lengths):
-                proportion = length / total_doc_len if total_doc_len > 0 else 0
-                keep_len = max(1, int(proportion * available))
-                trimmed_tokens = tokens[:keep_len]
-                trimmed_doc = self.tokenizer.decode(trimmed_tokens, skip_special_tokens=True)
-                processed_docs.append(trimmed_doc)
-            processed_example = {
-                'query': example['query'],
-                'documents': processed_docs
-            }
-            processed_data.append(processed_example)
-        return processed_data
-
-    def score_docs(self, dataset: List[Dict]):
-        text_scores_dict = defaultdict(dict)
-        for example in tqdm(dataset):
-            query_text = example['query']
-            doc_list = example['documents']
-            results = self.pipeline(query_text, doc_list, threshold=0.0)[0]
-            for result in results:
-                pred_document = result['label']
-                pred_doc_score = result['score']
-                text_scores_dict[query_text][pred_document] = pred_doc_score
-        return text_scores_dict
-
     def eval(self, dataset: str):
         corpus, queries, qrels = self.load_dataset(dataset)
-        dataset = self.prepare_data(corpus, queries, qrels)
-        dataset_chunk = self.chunk(dataset)
-        data_chunk_and_trim = self.seq_process(dataset_chunk)
-        text_scores = self.score_docs(data_chunk_and_trim)
-        results = self.text_to_id(text_scores, corpus, queries)
-        ndcg, _map, recall, precision = self.evaluate(qrels, results, [self.rerank_k])
-        mrr = self.evaluate_custom(qrels, results, [self.rerank_k], metric="mrr")
-        return ndcg, _map, mrr
+        texts, documents = self.prepare_data(corpus, queries, qrels)
+        pipeline = ZeroShotWithTruncationPipeline(model='knowledgator/gliclass_msmarco_merged',
+                                                  tokenizer='knowledgator/gliclass_msmarco_merged',
+                                                  max_classes=25, max_length=2048, classification_type='multi-label',
+                                                  device='cuda:0')
+        results = pipeline(texts, documents, threshold=0.5)
+        print(results)
+        return results
 
 
 evaluator = GLiClassBEIREvaluator('knowledgator/gliclass_msmarco_merged', 10)
